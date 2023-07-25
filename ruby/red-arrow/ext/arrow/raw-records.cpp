@@ -26,7 +26,8 @@ namespace red_arrow {
       explicit RawRecordsBuilder(VALUE records, int n_columns)
         : Converter(),
           records_(records),
-          n_columns_(n_columns) {
+          n_columns_(n_columns),
+          is_produce_mode_(false) {
       }
 
       void build(const arrow::RecordBatch& record_batch) {
@@ -67,6 +68,29 @@ namespace red_arrow {
           return Qnil;
         });
       }
+
+      void produce(const arrow::Table& table) {
+        rb::protect([&] {
+          is_produce_mode_ = true;
+          const auto n_rows = table.num_rows();
+          for (int64_t i = 0; i < n_rows; ++i) {
+            auto record = rb_ary_new_capa(n_columns_);
+            rb_ary_push(records_, record);
+          }
+          for (int i = 0; i < n_columns_; ++i) {
+            const auto& chunked_array = table.column(i).get();
+            column_index_ = i;
+            row_offset_ = 0;
+            for (const auto array : chunked_array->chunks()) {
+              check_status(array->Accept(this),
+                           "[table][raw-records]");
+              row_offset_ += array->length();
+            }
+          }
+          return Qnil;
+        });
+      }
+
 
 #define VISIT(TYPE)                                                     \
       arrow::Status Visit(const arrow::TYPE ## Array& array) override { \
@@ -125,9 +149,15 @@ namespace red_arrow {
             rb_ary_store(record, column_index_, value);
           }
         } else {
-          for (int64_t i = 0, ii = row_offset_; i < n; ++i, ++ii) {
-            auto record = rb_ary_entry(records_, ii);
-            rb_ary_store(record, column_index_, convert_value(array, i));
+          if (is_produce_mode_) {
+            auto record = rb_ary_entry(records_, row_offset_);
+            rb_ary_store(record, column_index_, convert_value(array, 0));
+            rb_yield(record);
+          } else {
+            for (int64_t i = 0, ii = row_offset_; i < n; ++i, ++ii) {
+              auto record = rb_ary_entry(records_, ii);
+              rb_ary_store(record, column_index_, convert_value(array, i));
+            }
           }
         }
       }
@@ -143,6 +173,8 @@ namespace red_arrow {
 
       // The number of columns.
       const int n_columns_;
+
+      bool is_produce_mode_;
     };
   }
 
@@ -180,5 +212,23 @@ namespace red_arrow {
     }
 
     return records;
+  }
+
+  VALUE
+  table_each_raw_record(VALUE rb_table) {
+    auto garrow_table = GARROW_TABLE(RVAL2GOBJ(rb_table));
+    auto table = garrow_table_get_raw(garrow_table).get();
+    const auto n_rows = table->num_rows();
+    const auto n_columns = table->num_columns();
+    auto records = rb_ary_new_capa(n_rows);
+
+    try {
+      RawRecordsBuilder builder(records, n_columns);
+      builder.produce(*table);
+    } catch (rb::State& state) {
+      state.jump();
+    }
+
+    return Qnil;
   }
 }
